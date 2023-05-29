@@ -8,6 +8,7 @@
 #include <cstring>
 #include "parstree.h"
 #include "tools.h"
+#include "vectorclass/vectorclass.h"
 
 ParsTree::ParsTree(): IQTree(){
     cost_matrix = NULL;
@@ -40,31 +41,31 @@ void ParsTree::loadCostMatrixFile(char * file_name){
 //    	cost_matrix = new SankoffCostMatrix(file_name);
 
     if(strcmp(file_name, "fitch") == 0 || strcmp(file_name, "e") == 0) { // uniform cost
-    	cost_nstates = aln->num_states;
-    	cost_matrix = aligned_alloc<unsigned int>(cost_nstates * cost_nstates);
-		for(int i = 0; i < cost_nstates; i++)
-			for(int j = 0; j < cost_nstates; j++){
-				if(j == i) cost_matrix[i * cost_nstates + j] = 0;
-				else cost_matrix[i * cost_nstates + j] = 1;
-			}
+        cost_nstates = aln->num_states;
+        cost_matrix = aligned_alloc<unsigned int>(cost_nstates * cost_nstates);
+        for(int i = 0; i < cost_nstates; i++)
+            for(int j = 0; j < cost_nstates; j++){
+                if(j == i) cost_matrix[i * cost_nstates + j] = 0;
+                else cost_matrix[i * cost_nstates + j] = 1;
+            }
     } else{ // Sankoff cost
         cout << "Loading cost matrix from " << file_name << "..." << endl;
-		ifstream fin(file_name);
-		if(!fin.is_open()){
-			outError("Reading cost matrix file cannot perform. Please check your input file!");
-		}
-		fin >> cost_nstates;
+        ifstream fin(file_name);
+        if(!fin.is_open()){
+            outError("Reading cost matrix file cannot perform. Please check your input file!");
+        }
+        fin >> cost_nstates;
 
-		// allocate memory for cost_matrix
-    	cost_matrix = aligned_alloc<unsigned int>(cost_nstates * cost_nstates);
+        // allocate memory for cost_matrix
+        cost_matrix = aligned_alloc<unsigned int>(cost_nstates * cost_nstates);
 
-		// read numbers from file
-		for(int i = 0; i < cost_nstates; i++){
-			for(int j = 0; j < cost_nstates; j++)
-				fin >> cost_matrix[i * cost_nstates + j];
-		}
+        // read numbers from file
+        for(int i = 0; i < cost_nstates; i++){
+            for(int j = 0; j < cost_nstates; j++)
+                fin >> cost_matrix[i * cost_nstates + j];
+        }
 
-		fin.close();
+        fin.close();
 
     }
 
@@ -112,7 +113,12 @@ int ParsTree::computeParsimony(){
     int nptn = aln->size();
     if(_pattern_pars == NULL) _pattern_pars = aligned_alloc<BootValTypePars>(nptn + VCSIZE_USHORT);
 
-    return computeParsimonyBranch((PhyloNeighbor*) root->neighbors[0], (PhyloNode*) root);
+    #ifdef __AVX
+        #define VECTORCLASS Vec8ui
+    #else
+        #define VECTORCLASS Vec4ui
+    #endif
+    return computeParsimonyBranch<VECTORCLASS>((PhyloNeighbor*) root->neighbors[0], (PhyloNode*) root);         
 }
 
 //inline UINT computeCostFromChild(UINT child_cost, UINT transition_cost){
@@ -124,8 +130,9 @@ compute partial parsimony score of the subtree rooted at dad
 @param dad_branch the branch leading to the subtree
 @param dad its dad, used to direct the traversal
 */
+template<class VECTORCLASS>
 void ParsTree::computePartialParsimony(PhyloNeighbor *dad_branch, PhyloNode *dad){
-	// don't recompute the parsimony
+    // don't recompute the parsimony
     if (dad_branch->partial_lh_computed & 2)
         return;
 
@@ -180,15 +187,15 @@ void ParsTree::computePartialParsimony(PhyloNeighbor *dad_branch, PhyloNode *dad
         UINT *left = NULL, *right = NULL;
 
         FOR_NEIGHBOR_IT(node, dad, it)if ((*it)->node->name != ROOT_NAME) {
-            computePartialParsimony((PhyloNeighbor*) (*it), (PhyloNode*) node);
+            computePartialParsimony<VECTORCLASS>((PhyloNeighbor*) (*it), (PhyloNode*) node);
             if (!left)
                 left = ((PhyloNeighbor*)*it)->partial_pars;
             else
                 right = ((PhyloNeighbor*)*it)->partial_pars;
         }
 
-
         if (node->degree() > 3) {
+            
             FOR_NEIGHBOR_IT(node, dad, it) if ((*it)->node->name != ROOT_NAME) {
                 UINT *partial_pars_child = ((PhyloNeighbor*) (*it))->partial_pars;
                 for (ptn = 0; ptn < aln->size(); ptn++){
@@ -216,62 +223,31 @@ void ParsTree::computePartialParsimony(PhyloNeighbor *dad_branch, PhyloNode *dad
             // bifurcating node
             assert(node->degree() == 3);
 
-            switch (nstates) {
-            case 4:
-                for (ptn = 0; ptn < aln->size(); ptn++){
-                    // ignore const ptn because it does not affect pars score
-                    if (aln->at(ptn).is_const) continue;
-                    int ptn_start_index = ptn*4;
-
+            if (aln->num_states != 2) {
+                
+                for(ptn = 0; ptn < aln->size(); ++ptn) {
+                    int ptn_start_index = ptn * aln->num_states;
                     UINT *left_ptr = &left[ptn_start_index];
                     UINT *right_ptr = &right[ptn_start_index];
                     UINT *partial_pars_ptr = &partial_pars[ptn_start_index];
-                    UINT *cost_matrix_ptr = cost_matrix;
-                    UINT left_contrib, right_contrib;
+                    fill(contribLeft, contribLeft + aln->num_states, INT32_MAX);
+                    fill(contribRight, contribRight + aln->num_states, INT32_MAX);
 
-                    for(i = 0; i < 4; i++){
-                        // min(j->i) from child_branch
-                        left_contrib = left_ptr[0] + cost_matrix_ptr[0];
-                        right_contrib = right_ptr[0] + cost_matrix_ptr[0];
-                        for(j = 1; j < 4; j++) {
-                            UINT value = left_ptr[j] + cost_matrix_ptr[j];
-                            left_contrib = min(value, left_contrib);
-                            value = right_ptr[j] + cost_matrix_ptr[j];
-                            right_contrib = min(value, right_contrib);
-                        }
-                        partial_pars_ptr[i] = left_contrib+right_contrib;
-                        cost_matrix_ptr += 4;
+                    for(int i = 0; i < aln->num_states; ++i) {
+                        // child(i) -> dad(j)
+                        for(int j = 0; j < aln->num_states; j += VECTORCLASS::size()) {
+                            VECTORCLASS* vectorLeft = (VECTORCLASS*) &contribLeft[j];
+                            VECTORCLASS* vectorRight = (VECTORCLASS*) &contribRight[j];  
+                            *vectorLeft = min(*vectorLeft, *((VECTORCLASS*) &inversed_cost_matrix[i][j]) + left_ptr[i]);
+                            *vectorRight = min(*vectorRight, *((VECTORCLASS*) &inversed_cost_matrix[i][j]) + right_ptr[i]); 
+                        }    
+                    }
+                    for(int i = 0; i < aln->num_states; ++i) {
+                        partial_pars_ptr[i] = contribLeft[i] + contribRight[i];
                     }
                 }
-                break;
-            case 20:
-                for (ptn = 0; ptn < aln->size(); ptn++){
-                    // ignore const ptn because it does not affect pars score
-                    if (aln->at(ptn).is_const) continue;
-                    int ptn_start_index = ptn*20;
-
-                    UINT *left_ptr = &left[ptn_start_index];
-                    UINT *right_ptr = &right[ptn_start_index];
-                    UINT *partial_pars_ptr = &partial_pars[ptn_start_index];
-                    UINT *cost_matrix_ptr = cost_matrix;
-                    UINT left_contrib, right_contrib;
-
-                    for(i = 0; i < 20; i++){
-                        // min(j->i) from child_branch
-                        left_contrib = left_ptr[0] + cost_matrix_ptr[0];
-                        right_contrib = right_ptr[0] + cost_matrix_ptr[0];
-                        for(j = 1; j < 20; j++) {
-                            UINT value = left_ptr[j] + cost_matrix_ptr[j];
-                            left_contrib = min(value, left_contrib);
-                            value = right_ptr[j] + cost_matrix_ptr[j];
-                            right_contrib = min(value, right_contrib);
-                        }
-                        partial_pars_ptr[i] = left_contrib+right_contrib;
-                        cost_matrix_ptr += 20;
-                    }
-                }
-                break;
-            default:
+                
+            } else {
                 for (ptn = 0; ptn < aln->size(); ptn++){
                     // ignore const ptn because it does not affect pars score
                     if (aln->at(ptn).is_const) continue;
@@ -297,27 +273,10 @@ void ParsTree::computePartialParsimony(PhyloNeighbor *dad_branch, PhyloNode *dad
                         cost_matrix_ptr += nstates;
                     }
                 }
-                break;
             }
-
+            
         }
-        /*
-
-        // calc subtree pars
-        for (ptn = 0; ptn < aln->size(); ptn++){
-            // ignore const ptn because it does not affect pars score
-            if (aln->at(ptn).is_const) continue;
-            int ptn_start_index = ptn * nstates;
-            UINT min_ptn_pars = partial_pars[ptn_start_index];
-            for(i = 1; i < nstates; i++){
-                if(partial_pars[ptn_start_index + i] < min_ptn_pars)
-                    min_ptn_pars = partial_pars[ptn_start_index + i];
-            }
-            partial_pars[pars_block_size - 1] += min_ptn_pars * aln->at(ptn).frequency;
-        }
-        */
     }
-
     dad_branch->partial_lh_computed |= 2;
 }
 
@@ -331,7 +290,7 @@ void ParsTree::initLeafSiteParsForAmbiguousState(char state, UINT * site_partial
     }
 
     if (state == STATE_INVALID){
-    	cout << "nstates = " << nstates << "; state = " << (int) state << endl;
+        cout << "nstates = " << nstates << "; state = " << (int) state << endl;
         outError("Alignment contains invalid state. Please check your data!");
     }
 
@@ -339,92 +298,92 @@ void ParsTree::initLeafSiteParsForAmbiguousState(char state, UINT * site_partial
 
     switch (nstates) {
         case 2:
-        	cout << "nstates = " << nstates << "; state = " << (int) state << endl;
-        	outError("Alignment contains invalid state. Please check your data!");
-        	break;
+            cout << "nstates = " << nstates << "; state = " << (int) state << endl;
+            outError("Alignment contains invalid state. Please check your data!");
+            break;
         case 4: // DNA
-			switch (state) {
-				case 1+4+3:
-					site_partial_pars[aln->convertState('A')] = 0;
-					site_partial_pars[aln->convertState('G')] = 0;
-					return; // A or G, Purine
-				case 2+8+3:
-					site_partial_pars[aln->convertState('C')] = 0;
-					site_partial_pars[aln->convertState('T')] = 0;
-					return; // C or T, Pyrimidine
-				case 1+8+3:
-					site_partial_pars[aln->convertState('A')] = 0;
-					site_partial_pars[aln->convertState('T')] = 0;
-					return; // A or T, Weak
-				case 2+4+3:
-					site_partial_pars[aln->convertState('G')] = 0;
-					site_partial_pars[aln->convertState('C')] = 0;
-					return; // G or C, Strong
-				case 1+2+3:
-					site_partial_pars[aln->convertState('A')] = 0;
-					site_partial_pars[aln->convertState('C')] = 0;
-					return; // A or C, Amino
-				case 4+8+3:
-					site_partial_pars[aln->convertState('G')] = 0;
-					site_partial_pars[aln->convertState('T')] = 0;
-					return; // G or T, Keto
-				case 2+4+8+3:
-					site_partial_pars[aln->convertState('C')] = 0;
-					site_partial_pars[aln->convertState('G')] = 0;
-					site_partial_pars[aln->convertState('T')] = 0;
-					return;// C or G or T
-				case 1+2+8+3:
-					site_partial_pars[aln->convertState('A')] = 0;
-					site_partial_pars[aln->convertState('C')] = 0;
-					site_partial_pars[aln->convertState('T')] = 0;
-					return; // A or C or T
-				case 1+4+8+3:
-					site_partial_pars[aln->convertState('A')] = 0;
-					site_partial_pars[aln->convertState('G')] = 0;
-					site_partial_pars[aln->convertState('T')] = 0;
-					return; // A or G or T
-				case 1+2+4+3:
-					site_partial_pars[aln->convertState('A')] = 0;
-					site_partial_pars[aln->convertState('G')] = 0;
-					site_partial_pars[aln->convertState('C')] = 0;
-					return; // A or G or C
-				case 18:
-					site_partial_pars[aln->convertState('A')] = 0;
-					site_partial_pars[aln->convertState('C')] = 0;
-					site_partial_pars[aln->convertState('G')] = 0;
-					site_partial_pars[aln->convertState('T')] = 0;
-					return; // UNKNOWN for DNA
-				default:
-					cout << "nstates = " << nstates << "; state = " << (int) state << endl;
-					outError("Alignment contains invalid state. Please check your data!");
-					return;
-			}
-			break;
+            switch (state) {
+                case 1+4+3:
+                    site_partial_pars[aln->convertState('A')] = 0;
+                    site_partial_pars[aln->convertState('G')] = 0;
+                    return; // A or G, Purine
+                case 2+8+3:
+                    site_partial_pars[aln->convertState('C')] = 0;
+                    site_partial_pars[aln->convertState('T')] = 0;
+                    return; // C or T, Pyrimidine
+                case 1+8+3:
+                    site_partial_pars[aln->convertState('A')] = 0;
+                    site_partial_pars[aln->convertState('T')] = 0;
+                    return; // A or T, Weak
+                case 2+4+3:
+                    site_partial_pars[aln->convertState('G')] = 0;
+                    site_partial_pars[aln->convertState('C')] = 0;
+                    return; // G or C, Strong
+                case 1+2+3:
+                    site_partial_pars[aln->convertState('A')] = 0;
+                    site_partial_pars[aln->convertState('C')] = 0;
+                    return; // A or C, Amino
+                case 4+8+3:
+                    site_partial_pars[aln->convertState('G')] = 0;
+                    site_partial_pars[aln->convertState('T')] = 0;
+                    return; // G or T, Keto
+                case 2+4+8+3:
+                    site_partial_pars[aln->convertState('C')] = 0;
+                    site_partial_pars[aln->convertState('G')] = 0;
+                    site_partial_pars[aln->convertState('T')] = 0;
+                    return;// C or G or T
+                case 1+2+8+3:
+                    site_partial_pars[aln->convertState('A')] = 0;
+                    site_partial_pars[aln->convertState('C')] = 0;
+                    site_partial_pars[aln->convertState('T')] = 0;
+                    return; // A or C or T
+                case 1+4+8+3:
+                    site_partial_pars[aln->convertState('A')] = 0;
+                    site_partial_pars[aln->convertState('G')] = 0;
+                    site_partial_pars[aln->convertState('T')] = 0;
+                    return; // A or G or T
+                case 1+2+4+3:
+                    site_partial_pars[aln->convertState('A')] = 0;
+                    site_partial_pars[aln->convertState('G')] = 0;
+                    site_partial_pars[aln->convertState('C')] = 0;
+                    return; // A or G or C
+                case 18:
+                    site_partial_pars[aln->convertState('A')] = 0;
+                    site_partial_pars[aln->convertState('C')] = 0;
+                    site_partial_pars[aln->convertState('G')] = 0;
+                    site_partial_pars[aln->convertState('T')] = 0;
+                    return; // UNKNOWN for DNA
+                default:
+                    cout << "nstates = " << nstates << "; state = " << (int) state << endl;
+                    outError("Alignment contains invalid state. Please check your data!");
+                    return;
+            }
+            break;
         case 20: // Protein
-        	if (state == 4+8+19){
-        		site_partial_pars[aln->convertState('D')] = 0;
-        		site_partial_pars[aln->convertState('N')] = 0;
-        		return; // Aspartic acid (D) or Asparagine (N)
-        	}
-        	else if (state == 32+64+19){
-        		site_partial_pars[aln->convertState('Q')] = 0;
-        		site_partial_pars[aln->convertState('E')] = 0;
-        		return; // Glutamine (Q) or Glutamic acid (E)
-        	}
-        	else if (state == 22){
-				for(i = 0; i < nstates; i++) site_partial_pars[i] = 0;
-        		return; // UNKNOWN for Protein
-        	}
-        	else{
-        		cout << "nstates = " << nstates << "; state = " << (int) state << endl;
-        		outError("Alignment contains invalid state. Please check your data!");
-        		return;
-        	}
+            if (state == 4+8+19){
+                site_partial_pars[aln->convertState('D')] = 0;
+                site_partial_pars[aln->convertState('N')] = 0;
+                return; // Aspartic acid (D) or Asparagine (N)
+            }
+            else if (state == 32+64+19){
+                site_partial_pars[aln->convertState('Q')] = 0;
+                site_partial_pars[aln->convertState('E')] = 0;
+                return; // Glutamine (Q) or Glutamic acid (E)
+            }
+            else if (state == 22){
+                for(i = 0; i < nstates; i++) site_partial_pars[i] = 0;
+                return; // UNKNOWN for Protein
+            }
+            else{
+                cout << "nstates = " << nstates << "; state = " << (int) state << endl;
+                outError("Alignment contains invalid state. Please check your data!");
+                return;
+            }
         default:
-        	// unknown
-        	cout << "nstates = " << nstates << "; state = " << (int) state << endl;
-        	outError("Alignment contains invalid state. Please check your data!");
-        	return;
+            // unknown
+            cout << "nstates = " << nstates << "; state = " << (int) state << endl;
+            outError("Alignment contains invalid state. Please check your data!");
+            return;
     }
 
 }
@@ -436,14 +395,29 @@ compute tree parsimony score based on a particular branch
 @param branch_subst (OUT) if not NULL, the number of substitutions on this branch
 @return parsimony score of the tree
 */
+template<class VECTORCLASS>
 int ParsTree::computeParsimonyBranch(PhyloNeighbor *dad_branch, PhyloNode *dad, int *branch_subst) {
     PhyloNode *node = (PhyloNode*) dad_branch->node;
     PhyloNeighbor *node_branch = (PhyloNeighbor*) node->findNeighbor(dad);
     assert(node_branch);
 
-    if (!central_partial_pars)
-        initializeAllPartialPars();
+    int contribSize = (aln->num_states + VECTORCLASS::size() - 1) / VECTORCLASS::size() * VECTORCLASS::size();
+    
+    contribLeft = new UINT[contribSize];
+    contribRight = new UINT[contribSize];
 
+    inversed_cost_matrix = new UINT* [aln->num_states];
+
+    for(int i = 0; i < aln->num_states; ++i) {
+        inversed_cost_matrix[i] = new UINT [aln->num_states];
+        for(int j = 0; j < aln->num_states; ++j) {
+            inversed_cost_matrix[i][j] = cost_matrix[j * aln->num_states + i];
+        }
+    }
+
+    if (!central_partial_pars) {
+        initializeAllPartialPars();
+    }
     // DTH: I don't really understand what this is for. ###########
     // swap node and dad if dad is a leaf
     if (node->isLeaf()) {
@@ -455,15 +429,15 @@ int ParsTree::computeParsimonyBranch(PhyloNeighbor *dad_branch, PhyloNode *dad, 
         node_branch = tmp_nei;
 //        cout << "swapped\n";
     }
-
     int nptn = aln->size();
     if(!_pattern_pars) _pattern_pars = aligned_alloc<BootValTypePars>(nptn+VCSIZE_USHORT);
     memset(_pattern_pars, 0, sizeof(BootValTypePars) * (nptn+VCSIZE_USHORT));
 
     if ((dad_branch->partial_lh_computed & 2) == 0)
-        computePartialParsimony(dad_branch, dad);
+        computePartialParsimony<VECTORCLASS>(dad_branch, dad);  
+    
     if ((node_branch->partial_lh_computed & 2) == 0)
-        computePartialParsimony(node_branch, node);
+        computePartialParsimony<VECTORCLASS>(node_branch, node);
 
     // now combine likelihood at the branch
     tree_pars = 0;
@@ -476,35 +450,35 @@ int ParsTree::computeParsimonyBranch(PhyloNeighbor *dad_branch, PhyloNode *dad, 
         exit(1);
     }
 
-    switch (nstates) {
-    case 4:
-        for (ptn = 0; ptn < aln->size(); ptn++){
-            _pattern_pars[ptn] = 0;
+    if (aln->num_states != 2) {
+        for(ptn = 0; ptn < aln->size(); ++ptn) {
             if (aln->at(ptn).is_const) continue;
-            
-            int ptn_start_index = ptn * 4;
-            UINT *node_branch_ptr = &node_branch->partial_pars[ptn_start_index];
-            UINT *dad_branch_ptr = &dad_branch->partial_pars[ptn_start_index];
-            UINT *cost_matrix_ptr = cost_matrix;
-            UINT min_ptn_pars = UINT_MAX;
-            for(i = 0; i < 4; i++){
-                // min(j->i) from node_branch
-                UINT min_score = node_branch_ptr[0] + cost_matrix_ptr[0];
-                for(j = 1; j < 4; j++) {
-                    UINT value = node_branch_ptr[j] + cost_matrix_ptr[j];
-                    min_score = min(value, min_score);
 
-                }
-                ptn_partial_pars[i] = min_score + dad_branch_ptr[i];
-                min_ptn_pars = min(min_ptn_pars, ptn_partial_pars[i]);
-                cost_matrix_ptr += 4;
+            int ptn_start_index = ptn * aln->num_states;
+            UINT *left_ptr = &node_branch->partial_pars[ptn_start_index];
+            UINT *right_ptr = &dad_branch->partial_pars[ptn_start_index];
+
+            fill(contribLeft, contribLeft + aln->num_states, UINT_MAX);
+            fill(contribRight, contribRight + aln->num_states, UINT_MAX);
+
+            for(int i = 0; i < aln->num_states; ++i) {
+                // child(i) -> dad(j)
+                for(int j = 0; j < aln->num_states; j += VECTORCLASS::size()) {
+                    VECTORCLASS* vectorLeft = (VECTORCLASS*) &contribLeft[j];
+                    VECTORCLASS* vectorRight = (VECTORCLASS*) &contribRight[j];  
+                    *vectorLeft = min(*vectorLeft, *((VECTORCLASS*) &inversed_cost_matrix[i][j]) + left_ptr[i]);
+                    *vectorRight = min(*vectorRight, *((VECTORCLASS*) &inversed_cost_matrix[i][j]) + right_ptr[i]); 
+                }    
+            }
+
+            UINT min_ptn_pars = INT32_MAX;
+            for(int i = 0; i < aln->num_states; ++i) {
+                min_ptn_pars = min(min_ptn_pars, contribLeft[i] + contribRight[i]);
             }
             _pattern_pars[ptn] = min_ptn_pars;
             tree_pars += min_ptn_pars * aln->at(ptn).frequency;
         }
-        break;
-
-    default:
+    } else {
         for (ptn = 0; ptn < aln->size(); ptn++){
             _pattern_pars[ptn] = 0;
             if (aln->at(ptn).is_const) continue;
@@ -529,7 +503,6 @@ int ParsTree::computeParsimonyBranch(PhyloNeighbor *dad_branch, PhyloNode *dad, 
             _pattern_pars[ptn] = min_ptn_pars;
             tree_pars += min_ptn_pars * aln->at(ptn).frequency;
         }
-        break;
     }
     if (branch_subst)
         *branch_subst = tree_pars;
@@ -541,7 +514,7 @@ int ParsTree::computeParsimonyBranch(PhyloNeighbor *dad_branch, PhyloNode *dad, 
 }
 
 void ParsTree::initializeAllPartialPars() {
-	PhyloTree::initializeAllPartialPars();
+    PhyloTree::initializeAllPartialPars();
 //    if(params->maximum_parsimony && (!_pattern_pars))
 //    	_pattern_pars = new UINT[aln->size()];
 //    int index = 0;
@@ -555,7 +528,7 @@ size_t ParsTree::getParsBlockSize(){
 }
 
 UINT* ParsTree::newBitsBlock(){
-	return new UINT[getParsBlockSize()];
+    return new UINT[getParsBlockSize()];
 }
 
 
@@ -588,93 +561,93 @@ void ParsTree::initializeAllPartialPars(int &index, PhyloNode *node, PhyloNode *
 }
 
 UINT* ParsTree::newPartialPars(){
-	UINT *ret = new UINT[getParsBlockSize()];
+    UINT *ret = new UINT[getParsBlockSize()];
     return ret;
 }
 
 void ParsTree::initParsData(Params* pars_params) {
-	if(!pars_params) return;
+    if(!pars_params) return;
     if(cost_matrix == NULL) loadCostMatrixFile(pars_params->sankoff_cost_file);
 }
 
 void ParsTree::printPatternScore() {
-	for(int i = 0; i < aln->getNPattern(); i++)
-		cout << _pattern_pars[i] << ", ";
+    for(int i = 0; i < aln->getNPattern(); i++)
+        cout << _pattern_pars[i] << ", ";
 }
 
 // find minimum spanning tree score for a given pattern
 UINT ParsTree::findMstScore(int ptn) {
 
-	//--- Initialize site_states to mark which state character is present in the pattern # 'ptn'
-	UINT * site_states = new UINT[aln->num_states];
-	// site_states[i] = 0 => state i is present, nonzero means it's absent
-	for(int i = 0; i < aln->num_states; i++) site_states[i] = UINT_MAX;
-	Pattern pat = aln->at(ptn);
-	for(int j = 0; j < pat.size(); j++){
-		if(pat[j] < aln->num_states) site_states[pat[j]] = 0;
+    //--- Initialize site_states to mark which state character is present in the pattern # 'ptn'
+    UINT * site_states = new UINT[aln->num_states];
+    // site_states[i] = 0 => state i is present, nonzero means it's absent
+    for(int i = 0; i < aln->num_states; i++) site_states[i] = UINT_MAX;
+    Pattern pat = aln->at(ptn);
+    for(int j = 0; j < pat.size(); j++){
+        if(pat[j] < aln->num_states) site_states[pat[j]] = 0;
 //		else initLeafSiteParsForAmbiguousState(pat[j], site_states)
-	}
+    }
 
-	int state_count = 0;
-	for(int i = 0; i < aln->num_states; i++)
-		if(site_states[i] == 0) state_count++;
-	if(state_count <= 1) return 0;
+    int state_count = 0;
+    for(int i = 0; i < aln->num_states; i++)
+        if(site_states[i] == 0) state_count++;
+    if(state_count <= 1) return 0;
 
 //	cout << "state_count = " << state_count << endl;
 
-	//--- Prim algorithm
-	UINT * labelled_value = new UINT[aln->num_states];
-	bool * added = new bool[aln->num_states];
-	for(int i = 0; i < aln->num_states; i++) labelled_value[i] = UINT_MAX;
-	for(int i = 0; i < aln->num_states; i++) added[i] = false;
+    //--- Prim algorithm
+    UINT * labelled_value = new UINT[aln->num_states];
+    bool * added = new bool[aln->num_states];
+    for(int i = 0; i < aln->num_states; i++) labelled_value[i] = UINT_MAX;
+    for(int i = 0; i < aln->num_states; i++) added[i] = false;
 
-	int add_node;
+    int add_node;
 //	labeled_value[0] = 0;
-	int count = 0;
+    int count = 0;
 
-	do{
-		if(count == 0){
-			for(int c = 0; c < aln->num_states; c++){
-				if((added[c] == false) && (site_states[c] == 0)){
-					labelled_value[c] = 0;
+    do{
+        if(count == 0){
+            for(int c = 0; c < aln->num_states; c++){
+                if((added[c] == false) && (site_states[c] == 0)){
+                    labelled_value[c] = 0;
 //					cout << "c = " << c << endl;
-					break;
-				}
-			}
-		}
-		// find among nodes unadded the one with smallest value
-		int min_label = UINT_MAX;
-		add_node = -1;
-		for(int c = 0; c < aln->num_states; c++){
-			if((added[c] == false) && (site_states[c] == 0))
-				if(labelled_value[c] < min_label){
-					min_label = labelled_value[c];
-					add_node = c;
-				}
-		}
+                    break;
+                }
+            }
+        }
+        // find among nodes unadded the one with smallest value
+        int min_label = UINT_MAX;
+        add_node = -1;
+        for(int c = 0; c < aln->num_states; c++){
+            if((added[c] == false) && (site_states[c] == 0))
+                if(labelled_value[c] < min_label){
+                    min_label = labelled_value[c];
+                    add_node = c;
+                }
+        }
 
-		if(add_node >= 0){
-			added[add_node] = true;
-			count++;
-		}else break;
+        if(add_node >= 0){
+            added[add_node] = true;
+            count++;
+        }else break;
 
-		// update adjacent list
-		for(int c = 0; c < aln->num_states; c++)
-			if((site_states[c] == 0) && (added[c] == false)){
-				if(labelled_value[c] > cost_matrix[add_node * cost_nstates + c])
-					labelled_value[c] = cost_matrix[add_node * cost_nstates + c];
-			}
-	}while(count < aln->num_states);
+        // update adjacent list
+        for(int c = 0; c < aln->num_states; c++)
+            if((site_states[c] == 0) && (added[c] == false)){
+                if(labelled_value[c] > cost_matrix[add_node * cost_nstates + c])
+                    labelled_value[c] = cost_matrix[add_node * cost_nstates + c];
+            }
+    }while(count < aln->num_states);
 
-	UINT score = 0;
-	for(int i = 0; i < aln->num_states; i++)
-		if(site_states[i] == 0)
-			score += labelled_value[i];
+    UINT score = 0;
+    for(int i = 0; i < aln->num_states; i++)
+        if(site_states[i] == 0)
+            score += labelled_value[i];
 
-	delete [] site_states;
-	delete [] labelled_value;
-	delete [] added;
-	return score;
+    delete [] site_states;
+    delete [] labelled_value;
+    delete [] added;
+    return score;
 
 }
 
