@@ -2779,7 +2779,7 @@ void optimizeAlignment(IQTree * & tree, Params & params){
         cout << "Time for reading: " << getCPUTime() - start << " seconds" << endl;
     }else{
         cout << "\nComputing random stepwise addition parsimony tree for evaluating patterns..." << endl;
-    	tree->initTopologyByPLLRandomAdition(params); // pll ras
+    		tree->initTopologyByPLLRandomAdition(params); // pll ras
         // tree->computeParsimonyTree(params.out_prefix, tree->aln); // iqtree ras
         cout << "Time for random stepwise addition parsimony tree construction: " << getCPUTime() - start << " seconds" << endl;
     }
